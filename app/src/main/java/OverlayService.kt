@@ -9,13 +9,19 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
+import android.provider.Settings
 import android.view.Gravity
+import android.view.Surface
 import android.view.View
 import android.view.WindowManager
 import android.widget.ImageView
@@ -28,10 +34,16 @@ import com.example.dynamic.R
 
 class OverlayService : Service() {
 
+    companion object {
+        @Volatile
+        var isRunning: Boolean = false
+    }
+
     private lateinit var windowManager: WindowManager
     private lateinit var pillView: LinearLayout
     private lateinit var albumArt: ImageView
     private lateinit var barsContainer: LinearLayout
+    private lateinit var waveContainer: LinearLayout
     private lateinit var timerIcon: ImageView
     private lateinit var timerText: TextView
     private lateinit var answerCallBtn: TextView
@@ -39,11 +51,12 @@ class OverlayService : Service() {
     private var isExpanded = false
     private var currentTitle = ""
     private var currentArtist = ""
-    private val PILL_SMALL = 300
-    private val PILL_LARGE = 400
-    private val PILL_CALL = 520
-    private val PILL_EXPANDED = 600
+    private val PILL_SMALL = 200
+    private val PILL_LARGE = 300
+    private val PILL_CALL = 400
+    private val PILL_EXPANDED = 500
     private val PILL_HEIGHT = 82
+    private val PULSE_TIMEOUT_MS = 900L
     private val SPOTIFY_PACKAGE = "com.spotify.music"
     private val MEDIA_TARGET_PACKAGES = listOf(
         SPOTIFY_PACKAGE,
@@ -54,20 +67,41 @@ class OverlayService : Service() {
     private val CLOCK_PACKAGES = listOf("com.google.android.deskclock", "com.sec.android.app.clockpackage")
     private val CALL_PACKAGES = listOf("com.google.android.dialer", "com.samsung.android.dialer", "com.whatsapp")
     private val barAnimators = mutableListOf<ValueAnimator>()
+    private val waveAnimators = mutableListOf<ValueAnimator>()
     private val visibilityHandler = Handler(Looper.getMainLooper())
     private var widthAnimator: ValueAnimator? = null
     private var timerIconAnimator: ValueAnimator? = null
+    private var navigationIconAnimator: ValueAnimator? = null
     private var isPillHiddenForForegroundApp = false
     private var isTimerActive = false
+    private var isNavigationActive = false
     private var isTransferActive = false
     private var isCallActive = false
+    private var isMediaActive = false
+    private var isPulseEnabled = true
+    private var isPulseActive = false
+    private var isReceiverRegistered = false
+    private var isOverlayAttached = false
+    private var lastRotation = Surface.ROTATION_0
     private var activeMediaSourcePackage: String? = null
     private var activeTimerSourcePackage: String? = null
+    private var activeNavigationSourcePackage: String? = null
     private var activeTransferSourcePackage: String? = null
+    private var activePulseSourcePackage: String? = null
     private var activeCallSourcePackage: String? = null
     private var activeCallKey: String? = null
+    private val prefsName = "dynamic_prefs"
+    private val keyPulseEnabled = "notification_pulse_enabled"
+    private val keyVisualizerMode = "visualizer_mode"
+    private var visualizerMode = "BAR"
+    private val pulseResetRunnable = Runnable {
+        if (!isPulseActive) return@Runnable
+        clearPulseState()
+        renderStateAfterTransient()
+    }
     private val visibilityCheckRunnable = object : Runnable {
         override fun run() {
+            updatePillPositionForRotation()
             updatePillVisibilityForForegroundApp()
             visibilityHandler.postDelayed(this, 700)
         }
@@ -77,7 +111,8 @@ class OverlayService : Service() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
                 "MEDIA_UPDATE" -> {
-                    activeMediaSourcePackage = intent.getStringExtra("sourcePackage")
+                    activeMediaSourcePackage = intent.getStringExtra("sourcePackage") ?: activeMediaSourcePackage
+                    isMediaActive = true
                     currentTitle = intent.getStringExtra("title") ?: ""
                     currentArtist = intent.getStringExtra("artist") ?: ""
                     val art = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
@@ -91,24 +126,53 @@ class OverlayService : Service() {
                     } else {
                         albumArt.setImageResource(R.drawable.ic_dynamic_media)
                     }
-                    if (!isTimerActive && !isTransferActive && !isCallActive) {
-                        albumArt.visibility = View.VISIBLE
-                        barsContainer.visibility = View.VISIBLE
-                        startBarsAnimation()
+                    if (!isTimerActive && !isNavigationActive && !isTransferActive && !isCallActive && !isPulseActive) {
+                        showMediaVisualizer()
                         setupCompactContent()
                         animateWidth(PILL_LARGE)
                     }
                 }
                 "MEDIA_STOPPED" -> {
                     activeMediaSourcePackage = null
+                    isMediaActive = false
                     currentTitle = ""
                     currentArtist = ""
-                    if (!isTimerActive && !isTransferActive && !isCallActive) {
-                        stopBarsAnimation()
+                    if (!isTimerActive && !isNavigationActive && !isTransferActive && !isCallActive && !isPulseActive) {
+                        stopMediaVisualizerAnimation()
                         albumArt.visibility = View.GONE
                         barsContainer.visibility = View.GONE
+                        waveContainer.visibility = View.GONE
                         setupCompactContent()
                         animateWidth(PILL_SMALL)
+                    }
+                }
+                "VISUALIZER_MODE_UPDATE" -> {
+                    val mode = intent.getStringExtra("mode")?.uppercase() ?: "BAR"
+                    applyVisualizerMode(mode)
+                }
+                "NAVIGATION_UPDATE" -> {
+                    if (isCallActive) return
+                    isNavigationActive = true
+                    activeNavigationSourcePackage = intent.getStringExtra("sourcePackage")
+                    timerIcon.setImageResource(R.drawable.ic_dynamic_media)
+                    timerText.text = intent.getStringExtra("text") ?: "Yol tarifi aktif"
+                    timerIcon.visibility = View.VISIBLE
+                    timerText.visibility = View.VISIBLE
+                    stopMediaVisualizerAnimation()
+                    stopTimerIconAnimation()
+                    setupCompactContent()
+                    startNavigationIconAnimation()
+                    if (!isPulseActive) animateWidth(PILL_LARGE)
+                }
+                "NAVIGATION_STOPPED" -> {
+                    if (!isNavigationActive) return
+                    isNavigationActive = false
+                    activeNavigationSourcePackage = null
+                    stopNavigationIconAnimation()
+                    timerIcon.visibility = View.GONE
+                    timerText.visibility = View.GONE
+                    if (!isPulseActive) {
+                        renderStateAfterTransient()
                     }
                 }
                 "TIMER_UPDATE", "STOPWATCH_UPDATE", "COUNTDOWN_UPDATE" -> {
@@ -121,10 +185,11 @@ class OverlayService : Service() {
                     timerText.text = formatTimerText(intent, isCountdown)
                     timerIcon.visibility = View.VISIBLE
                     timerText.visibility = View.VISIBLE
-                    stopBarsAnimation()
+                    stopMediaVisualizerAnimation()
+                    stopNavigationIconAnimation()
                     setupCompactContent()
                     startTimerIconAnimation()
-                    animateWidth(PILL_LARGE)
+                    if (!isPulseActive) animateWidth(PILL_LARGE)
                 }
                 "TIMER_STOPPED", "STOPWATCH_STOPPED", "COUNTDOWN_STOPPED" -> {
                     if (isCallActive) return
@@ -138,16 +203,19 @@ class OverlayService : Service() {
                         timerIcon.visibility = View.VISIBLE
                         timerText.visibility = View.VISIBLE
                         startTimerIconAnimation()
-                        animateWidth(PILL_LARGE)
-                    } else if (currentTitle.isNotEmpty()) {
-                        albumArt.visibility = View.VISIBLE
-                        barsContainer.visibility = View.VISIBLE
-                        startBarsAnimation()
-                        animateWidth(PILL_LARGE)
+                        if (!isPulseActive) animateWidth(PILL_LARGE)
+                    } else if (isNavigationActive) {
+                        timerIcon.visibility = View.VISIBLE
+                        timerText.visibility = View.VISIBLE
+                        startNavigationIconAnimation()
+                        if (!isPulseActive) animateWidth(PILL_LARGE)
+                    } else if (isMediaActive) {
+                        showMediaVisualizer()
+                        if (!isPulseActive) animateWidth(PILL_LARGE)
                     } else {
                         albumArt.visibility = View.GONE
                         barsContainer.visibility = View.GONE
-                        animateWidth(PILL_SMALL)
+                        if (!isPulseActive) animateWidth(PILL_SMALL)
                     }
                 }
                 "TRANSFER_UPDATE" -> {
@@ -162,10 +230,11 @@ class OverlayService : Service() {
                     timerText.text = intent.getStringExtra("text") ?: "Aktarim devam ediyor"
                     timerIcon.visibility = View.VISIBLE
                     timerText.visibility = View.VISIBLE
-                    stopBarsAnimation()
+                    stopMediaVisualizerAnimation()
+                    stopNavigationIconAnimation()
                     setupCompactContent()
                     startTimerIconAnimation()
-                    animateWidth(PILL_LARGE)
+                    if (!isPulseActive) animateWidth(PILL_LARGE)
                 }
                 "TRANSFER_STOPPED" -> {
                     if (!isTransferActive) return
@@ -176,31 +245,90 @@ class OverlayService : Service() {
                     timerIcon.visibility = View.GONE
                     timerText.visibility = View.GONE
                     setupCompactContent()
-                    if (currentTitle.isNotEmpty()) {
-                        albumArt.visibility = View.VISIBLE
-                        barsContainer.visibility = View.VISIBLE
-                        startBarsAnimation()
-                        animateWidth(PILL_LARGE)
+                    if (isNavigationActive) {
+                        timerIcon.visibility = View.VISIBLE
+                        timerText.visibility = View.VISIBLE
+                        startNavigationIconAnimation()
+                        if (!isPulseActive) animateWidth(PILL_LARGE)
+                    } else if (isMediaActive) {
+                        showMediaVisualizer()
+                        if (!isPulseActive) animateWidth(PILL_LARGE)
                     } else {
                         albumArt.visibility = View.GONE
                         barsContainer.visibility = View.GONE
-                        animateWidth(PILL_SMALL)
+                        if (!isPulseActive) animateWidth(PILL_SMALL)
                     }
+                }
+                "PULSE_TOGGLE" -> {
+                    val enabled = intent.getBooleanExtra("enabled", true)
+                    isPulseEnabled = enabled
+                    getSharedPreferences(prefsName, MODE_PRIVATE)
+                        .edit()
+                        .putBoolean(keyPulseEnabled, enabled)
+                        .apply()
+                    if (!enabled && isPulseActive) {
+                        clearPulseState()
+                        renderStateAfterTransient()
+                    }
+                }
+                "PULSE_UPDATE" -> {
+                    if (!isPulseEnabled || isCallActive) return
+                    val iconBitmap = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableExtra("appIcon", Bitmap::class.java)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        intent.getParcelableExtra("appIcon")
+                    }
+                    val sourcePackage = intent.getStringExtra("sourcePackage")
+                    activePulseSourcePackage = sourcePackage
+                    isPulseActive = true
+
+                    val isWhatsAppMessage = sourcePackage == "com.whatsapp"
+                    if (isWhatsAppMessage) {
+                        val waIcon = runCatching { packageManager.getApplicationIcon("com.whatsapp") }.getOrNull()
+                        if (waIcon != null) {
+                            albumArt.setImageDrawable(waIcon)
+                        } else if (iconBitmap != null) {
+                            albumArt.setImageBitmap(iconBitmap)
+                        } else {
+                            albumArt.setImageResource(R.drawable.ic_dynamic_media)
+                        }
+                    } else if (iconBitmap != null) {
+                        albumArt.setImageBitmap(iconBitmap)
+                    } else {
+                        albumArt.setImageResource(R.drawable.ic_dynamic_media)
+                    }
+                    albumArt.visibility = View.VISIBLE
+                    barsContainer.visibility = View.GONE
+                    waveContainer.visibility = View.GONE
+                    timerIcon.visibility = View.GONE
+                    timerText.visibility = View.GONE
+                    setupCompactContent()
+                    animateWidth(PILL_LARGE)
+                    performTickVibration(18L)
+                    visibilityHandler.removeCallbacks(pulseResetRunnable)
+                    visibilityHandler.postDelayed(pulseResetRunnable, PULSE_TIMEOUT_MS)
                 }
                 "CALL_UPDATE" -> {
                     isCallActive = true
                     activeCallSourcePackage = intent.getStringExtra("sourcePackage")
                     activeCallKey = intent.getStringExtra("callKey")
-                    timerIcon.setImageResource(R.drawable.ic_dynamic_call)
-                    timerText.text = intent.getStringExtra("callerName") ?: "Arayan"
-                    timerIcon.visibility = View.VISIBLE
-                    timerText.visibility = View.VISIBLE
-                    answerCallBtn.visibility = View.VISIBLE
-                    rejectCallBtn.visibility = View.VISIBLE
-                    stopBarsAnimation()
+                    // Cagri durumunda her zaman telefon ikonu gosterilir.
+                    albumArt.setImageResource(R.drawable.ic_dynamic_call)
+                    albumArt.visibility = View.VISIBLE
+                    barsContainer.visibility = View.GONE
+                    waveContainer.visibility = View.GONE
+                    timerIcon.visibility = View.GONE
+                    timerText.visibility = View.GONE
+                    answerCallBtn.visibility = View.GONE
+                    rejectCallBtn.visibility = View.GONE
+                    stopMediaVisualizerAnimation()
                     stopTimerIconAnimation()
+                    stopNavigationIconAnimation()
+                    visibilityHandler.removeCallbacks(pulseResetRunnable)
+                    isPulseActive = false
                     setupCompactContent()
-                    animateWidth(PILL_CALL)
+                    animateWidth(PILL_LARGE)
                 }
                 "CALL_STOPPED" -> {
                     if (!isCallActive) return
@@ -209,6 +337,7 @@ class OverlayService : Service() {
                     activeCallKey = null
                     answerCallBtn.visibility = View.GONE
                     rejectCallBtn.visibility = View.GONE
+                    albumArt.visibility = View.GONE
                     timerIcon.setImageResource(R.drawable.ic_dynamic_timer)
                     timerIcon.visibility = View.GONE
                     timerText.visibility = View.GONE
@@ -220,15 +349,19 @@ class OverlayService : Service() {
                         timerText.visibility = View.VISIBLE
                         startTimerIconAnimation()
                         animateWidth(PILL_LARGE)
+                    } else if (isNavigationActive) {
+                        timerIcon.setImageResource(R.drawable.ic_dynamic_media)
+                        timerIcon.visibility = View.VISIBLE
+                        timerText.visibility = View.VISIBLE
+                        startNavigationIconAnimation()
+                        animateWidth(PILL_LARGE)
                     } else if (isTransferActive) {
                         timerIcon.visibility = View.VISIBLE
                         timerText.visibility = View.VISIBLE
                         startTimerIconAnimation()
                         animateWidth(PILL_LARGE)
-                    } else if (currentTitle.isNotEmpty()) {
-                        albumArt.visibility = View.VISIBLE
-                        barsContainer.visibility = View.VISIBLE
-                        startBarsAnimation()
+                    } else if (isMediaActive) {
+                        showMediaVisualizer()
                         animateWidth(PILL_LARGE)
                     } else {
                         animateWidth(PILL_SMALL)
@@ -239,28 +372,54 @@ class OverlayService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (!Settings.canDrawOverlays(this)) {
+            isRunning = false
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        isPulseEnabled = getSharedPreferences(prefsName, MODE_PRIVATE)
+            .getBoolean(keyPulseEnabled, true)
+        visualizerMode = getSharedPreferences(prefsName, MODE_PRIVATE)
+            .getString(keyVisualizerMode, "BAR")
+            ?.uppercase() ?: "BAR"
+        isRunning = true
         startForeground(1, createNotification())
         showOverlay()
-        val filter = IntentFilter().apply {
-            addAction("MEDIA_UPDATE")
-            addAction("MEDIA_STOPPED")
-            addAction("TIMER_UPDATE")
-            addAction("TIMER_STOPPED")
-            addAction("STOPWATCH_UPDATE")
-            addAction("STOPWATCH_STOPPED")
-            addAction("COUNTDOWN_UPDATE")
-            addAction("COUNTDOWN_STOPPED")
-            addAction("TRANSFER_UPDATE")
-            addAction("TRANSFER_STOPPED")
-            addAction("CALL_UPDATE")
-            addAction("CALL_STOPPED")
+        if (!isReceiverRegistered) {
+            val filter = IntentFilter().apply {
+                addAction("MEDIA_UPDATE")
+                addAction("MEDIA_STOPPED")
+                addAction("TIMER_UPDATE")
+                addAction("TIMER_STOPPED")
+                addAction("STOPWATCH_UPDATE")
+                addAction("STOPWATCH_STOPPED")
+                addAction("COUNTDOWN_UPDATE")
+                addAction("COUNTDOWN_STOPPED")
+                addAction("TRANSFER_UPDATE")
+                addAction("TRANSFER_STOPPED")
+                addAction("CALL_UPDATE")
+                addAction("CALL_STOPPED")
+                addAction("PULSE_UPDATE")
+                addAction("PULSE_TOGGLE")
+                addAction("NAVIGATION_UPDATE")
+                addAction("NAVIGATION_STOPPED")
+                addAction("VISUALIZER_MODE_UPDATE")
+            }
+            ContextCompat.registerReceiver(this, mediaReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+            isReceiverRegistered = true
         }
-        ContextCompat.registerReceiver(this, mediaReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
         startVisibilityMonitor()
+        updatePillPositionForRotation(force = true)
         return START_STICKY
     }
 
     private fun showOverlay() {
+        if (isOverlayAttached && ::pillView.isInitialized) {
+            updatePillPositionForRotation(force = true)
+            return
+        }
+
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
 
         pillView = LinearLayout(this).apply {
@@ -296,6 +455,16 @@ class OverlayService : Service() {
             visibility = View.GONE
         }
 
+        waveContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+            visibility = View.GONE
+        }
+
         repeat(4) { i ->
             val bar = View(this).apply {
                 layoutParams = LinearLayout.LayoutParams(6, 20).apply {
@@ -307,6 +476,22 @@ class OverlayService : Service() {
                 }
             }
             barsContainer.addView(bar)
+        }
+
+        repeat(3) { i ->
+            val wave = View(this).apply {
+                layoutParams = LinearLayout.LayoutParams(
+                    if (i == 1) 22 else 14,
+                    5
+                ).apply {
+                    marginStart = if (i == 0) 0 else 6
+                }
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    setColor(Color.parseColor("#1DB954"))
+                    cornerRadius = 6f
+                }
+            }
+            waveContainer.addView(wave)
         }
 
         timerIcon = ImageView(this).apply {
@@ -362,15 +547,19 @@ class OverlayService : Service() {
         setupCompactContent()
 
         pillView.setOnClickListener {
-            val targetPackage = if (isCallActive) {
+            val targetPackage = if (isPulseActive) {
+                activePulseSourcePackage ?: SPOTIFY_PACKAGE
+            } else if (isCallActive) {
                 activeCallSourcePackage ?: CALL_PACKAGES.firstOrNull { isPackageInstalled(it) } ?: SPOTIFY_PACKAGE
             } else if (isTimerActive) {
                 activeTimerSourcePackage ?: CLOCK_PACKAGES.firstOrNull { isPackageInstalled(it) } ?: SPOTIFY_PACKAGE
+            } else if (isNavigationActive) {
+                activeNavigationSourcePackage ?: "com.google.android.apps.maps"
             } else if (isTransferActive) {
                 activeTransferSourcePackage
                     ?: MEDIA_TARGET_PACKAGES.firstOrNull { isPackageInstalled(it) }
                     ?: SPOTIFY_PACKAGE
-            } else if (currentTitle.isNotEmpty()) {
+            } else if (isMediaActive) {
                 activeMediaSourcePackage
                     ?: MEDIA_TARGET_PACKAGES.firstOrNull { isPackageInstalled(it) }
                     ?: SPOTIFY_PACKAGE
@@ -383,7 +572,17 @@ class OverlayService : Service() {
         }
 
         pillView.setOnLongClickListener {
-            if (isExpanded) collapseControls() else expandControls()
+            performTickVibration(28L)
+            when {
+                isCallActive || isTimerActive || isNavigationActive || isTransferActive || isMediaActive || isPulseActive -> {
+                    sendBroadcast(Intent("PROCESS_COMMAND").apply {
+                        putExtra("mode", currentOperationMode())
+                        putExtra("sourcePackage", currentOperationPackage())
+                        putExtra("callKey", activeCallKey)
+                    })
+                }
+                else -> if (isExpanded) collapseControls() else expandControls()
+            }
             true
         }
 
@@ -401,7 +600,10 @@ class OverlayService : Service() {
             y = 20
         }
 
+        applyPillGravityForRotation(params, getCurrentRotation())
+
         windowManager.addView(pillView, params)
+        isOverlayAttached = true
     }
 
     private fun setupCompactContent() {
@@ -415,13 +617,14 @@ class OverlayService : Service() {
             )
         }
 
-        if (isCallActive) {
-            timerText.layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-            pillView.addView(timerIcon)
-            pillView.addView(timerText)
-            pillView.addView(rejectCallBtn)
-            pillView.addView(answerCallBtn)
-        } else if (isTimerActive || isTransferActive) {
+        if (isPulseActive) {
+            pillView.addView(albumArt)
+            pillView.addView(centerSpacer)
+        } else if (isCallActive) {
+            // Cagri ekraninda da sadece ikon gorunur; yanitla/reddet butonlari gizlidir.
+            pillView.addView(albumArt)
+            pillView.addView(centerSpacer)
+        } else if (isTimerActive || isNavigationActive || isTransferActive) {
             // Timer/transfer modunda solda ikon, sagda bilgi metni gorunur.
             timerText.layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
             pillView.addView(timerIcon)
@@ -431,7 +634,7 @@ class OverlayService : Service() {
             // Compact halde kapağı sola, barları sağa sabitliyoruz.
             pillView.addView(albumArt)
             pillView.addView(centerSpacer)
-            pillView.addView(barsContainer)
+            pillView.addView(if (visualizerMode == "WAVE") waveContainer else barsContainer)
         }
     }
 
@@ -460,6 +663,75 @@ class OverlayService : Service() {
         barAnimators.clear()
     }
 
+    private fun startWaveAnimation() {
+        stopWaveAnimation()
+        for (i in 0 until waveContainer.childCount) {
+            val wave = waveContainer.getChildAt(i)
+            val animator = ValueAnimator.ofFloat(0.5f, 1.3f).apply {
+                duration = (520 + i * 120).toLong()
+                repeatMode = ValueAnimator.REVERSE
+                repeatCount = ValueAnimator.INFINITE
+                startDelay = (i * 140).toLong()
+                addUpdateListener {
+                    val scaleY = it.animatedValue as Float
+                    wave.scaleY = scaleY
+                    wave.alpha = 0.55f + (scaleY - 0.5f) * 0.55f
+                }
+            }
+            animator.start()
+            waveAnimators.add(animator)
+        }
+    }
+
+    private fun stopWaveAnimation() {
+        waveAnimators.forEach { it.cancel() }
+        waveAnimators.clear()
+        if (::waveContainer.isInitialized) {
+            for (i in 0 until waveContainer.childCount) {
+                waveContainer.getChildAt(i).apply {
+                    scaleY = 1f
+                    alpha = 1f
+                }
+            }
+        }
+    }
+
+    private fun stopMediaVisualizerAnimation() {
+        stopBarsAnimation()
+        stopWaveAnimation()
+    }
+
+    private fun showMediaVisualizer() {
+        albumArt.visibility = View.VISIBLE
+        if (visualizerMode == "WAVE") {
+            barsContainer.visibility = View.GONE
+            waveContainer.visibility = View.VISIBLE
+            startWaveAnimation()
+        } else {
+            waveContainer.visibility = View.GONE
+            barsContainer.visibility = View.VISIBLE
+            startBarsAnimation()
+        }
+    }
+
+    private fun applyVisualizerMode(mode: String) {
+        visualizerMode = if (mode == "WAVE") "WAVE" else "BAR"
+        getSharedPreferences(prefsName, MODE_PRIVATE)
+            .edit()
+            .putString(keyVisualizerMode, visualizerMode)
+            .apply()
+
+        if (!::pillView.isInitialized) return
+        setupCompactContent()
+        if (isMediaActive && !isTimerActive && !isNavigationActive && !isTransferActive && !isCallActive && !isPulseActive) {
+            showMediaVisualizer()
+        } else {
+            stopMediaVisualizerAnimation()
+            barsContainer.visibility = View.GONE
+            waveContainer.visibility = View.GONE
+        }
+    }
+
     private fun startTimerIconAnimation() {
         if (timerIconAnimator?.isRunning == true) return
 
@@ -475,12 +747,136 @@ class OverlayService : Service() {
         timerIconAnimator?.start()
     }
 
+    private fun startNavigationIconAnimation() {
+        if (navigationIconAnimator?.isRunning == true) return
+
+        navigationIconAnimator?.cancel()
+        navigationIconAnimator = ValueAnimator.ofFloat(0.88f, 1.08f).apply {
+            duration = 900
+            repeatCount = ValueAnimator.INFINITE
+            repeatMode = ValueAnimator.REVERSE
+            interpolator = android.view.animation.AccelerateDecelerateInterpolator()
+            addUpdateListener {
+                val scale = it.animatedValue as Float
+                timerIcon.scaleX = scale
+                timerIcon.scaleY = scale
+            }
+        }
+        navigationIconAnimator?.start()
+    }
+
+    private fun stopNavigationIconAnimation() {
+        navigationIconAnimator?.cancel()
+        navigationIconAnimator = null
+        if (::timerIcon.isInitialized) {
+            timerIcon.scaleX = 1f
+            timerIcon.scaleY = 1f
+        }
+    }
+
     private fun stopTimerIconAnimation() {
         timerIconAnimator?.cancel()
         timerIconAnimator = null
         if (::timerIcon.isInitialized) {
             timerIcon.rotation = 0f
         }
+    }
+
+    private fun renderStateAfterTransient() {
+        if (!::pillView.isInitialized || !isOverlayAttached) return
+
+        stopMediaVisualizerAnimation()
+        if (!isTimerActive && !isTransferActive) stopTimerIconAnimation()
+        if (!isNavigationActive) stopNavigationIconAnimation()
+
+        when {
+            isCallActive -> {
+                setupCompactContent()
+                animateWidth(PILL_CALL)
+            }
+            isTimerActive -> {
+                timerIcon.setImageResource(R.drawable.ic_dynamic_timer)
+                timerIcon.visibility = View.VISIBLE
+                timerText.visibility = View.VISIBLE
+                setupCompactContent()
+                startTimerIconAnimation()
+                animateWidth(PILL_LARGE)
+            }
+            isNavigationActive -> {
+                timerIcon.setImageResource(R.drawable.ic_dynamic_media)
+                timerIcon.visibility = View.VISIBLE
+                timerText.visibility = View.VISIBLE
+                setupCompactContent()
+                startNavigationIconAnimation()
+                animateWidth(PILL_LARGE)
+            }
+            isTransferActive -> {
+                timerIcon.visibility = View.VISIBLE
+                timerText.visibility = View.VISIBLE
+                setupCompactContent()
+                startTimerIconAnimation()
+                animateWidth(PILL_LARGE)
+            }
+            isMediaActive -> {
+                showMediaVisualizer()
+                timerIcon.visibility = View.GONE
+                timerText.visibility = View.GONE
+                setupCompactContent()
+                animateWidth(PILL_LARGE)
+            }
+            else -> {
+                albumArt.visibility = View.GONE
+                barsContainer.visibility = View.GONE
+                timerIcon.visibility = View.GONE
+                timerText.visibility = View.GONE
+                setupCompactContent()
+                animateWidth(PILL_SMALL)
+            }
+        }
+    }
+
+    private fun currentOperationMode(): String {
+        return when {
+            isCallActive -> "CALL"
+            isPulseActive -> "NOTIFICATION"
+            isTimerActive -> "TIMER"
+            isNavigationActive -> "NAVIGATION"
+            isTransferActive -> "TRANSFER"
+            isMediaActive -> "MEDIA"
+            else -> "NONE"
+        }
+    }
+
+    private fun currentOperationPackage(): String? {
+        return when {
+            isCallActive -> activeCallSourcePackage
+            isPulseActive -> activePulseSourcePackage
+            isTimerActive -> activeTimerSourcePackage
+            isNavigationActive -> activeNavigationSourcePackage
+            isTransferActive -> activeTransferSourcePackage
+            isMediaActive -> activeMediaSourcePackage
+            else -> null
+        }
+    }
+
+    private fun performTickVibration(durationMs: Long) {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+            val vm = getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
+            vm?.defaultVibrator?.vibrate(
+                VibrationEffect.createOneShot(durationMs, VibrationEffect.DEFAULT_AMPLITUDE)
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            val vibrator = getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+            @Suppress("DEPRECATION")
+            vibrator?.vibrate(durationMs)
+        }
+    }
+
+    private fun clearPulseState() {
+        visibilityHandler.removeCallbacks(pulseResetRunnable)
+        isPulseActive = false
+        activePulseSourcePackage = null
     }
 
     private fun formatTimerText(intent: Intent, isCountdown: Boolean): String {
@@ -506,6 +902,7 @@ class OverlayService : Service() {
     }
 
     private fun animateWidth(to: Int) {
+        if (!isOverlayAttached || !::pillView.isInitialized) return
         val params = pillView.layoutParams as WindowManager.LayoutParams
         val from = params.width
         if (from == to) return
@@ -516,7 +913,11 @@ class OverlayService : Service() {
             interpolator = android.view.animation.DecelerateInterpolator()
             addUpdateListener {
                 params.width = it.animatedValue as Int
-                windowManager.updateViewLayout(pillView, params)
+                runCatching {
+                    if (isOverlayAttached) {
+                        windowManager.updateViewLayout(pillView, params)
+                    }
+                }
             }
         }
         widthAnimator?.start()
@@ -532,10 +933,15 @@ class OverlayService : Service() {
     }
 
     private fun updatePillVisibilityForForegroundApp() {
-        if (!::pillView.isInitialized) return
+        if (!::pillView.isInitialized || !isOverlayAttached) return
 
         val shouldHide = shouldHideForForegroundApp()
-        if (shouldHide == isPillHiddenForForegroundApp) return
+        if (shouldHide == isPillHiddenForForegroundApp) {
+            if (!shouldHide && pillView.visibility != View.VISIBLE) {
+                pillView.visibility = View.VISIBLE
+            }
+            return
+        }
 
         isPillHiddenForForegroundApp = shouldHide
         if (shouldHide) {
@@ -547,23 +953,35 @@ class OverlayService : Service() {
                 PILL_EXPANDED
             } else if (isCallActive) {
                 PILL_CALL
-            } else if (isTimerActive || isTransferActive || currentTitle.isNotEmpty()) {
+            } else if (isPulseActive || isTimerActive || isNavigationActive || isTransferActive || isMediaActive) {
                 PILL_LARGE
             } else {
                 PILL_SMALL
             }
-            if (isCallActive || isTimerActive || isTransferActive) setupCompactContent()
+            if (isCallActive || isPulseActive || isTimerActive || isNavigationActive || isTransferActive) setupCompactContent()
             animateWidth(targetWidth)
         }
     }
 
     private fun shouldHideForForegroundApp(): Boolean {
+        if (isPulseActive) {
+            return false
+        }
+
         if (isCallActive) {
             val callPackages = buildList {
                 activeCallSourcePackage?.let { add(it) }
                 addAll(CALL_PACKAGES)
             }
             return callPackages.any { isPackageForeground(it) }
+        }
+
+        if (isNavigationActive) {
+            val navPackages = buildList {
+                activeNavigationSourcePackage?.let { add(it) }
+                add("com.google.android.apps.maps")
+            }
+            return navPackages.any { isPackageForeground(it) }
         }
 
         if (isTimerActive) {
@@ -584,11 +1002,12 @@ class OverlayService : Service() {
             return transferPackages.any { isPackageForeground(it) }
         }
 
-        val foregroundHidePackages = buildList {
-            addAll(MEDIA_TARGET_PACKAGES)
-            addAll(CLOCK_PACKAGES)
+        // Spotify icinde local player UI varken pill gizli, uygulamadan cikinca tekrar gorunur.
+        if (isMediaActive && (activeMediaSourcePackage == SPOTIFY_PACKAGE || isPackageForeground(SPOTIFY_PACKAGE))) {
+            return isPackageForeground(SPOTIFY_PACKAGE)
         }
-        return foregroundHidePackages.any { isPackageForeground(it) }
+
+        return false
     }
 
     private fun isPackageForeground(packageName: String): Boolean {
@@ -677,9 +1096,59 @@ class OverlayService : Service() {
 
         animateWidth(
             if (isCallActive) PILL_CALL
-            else if (isTimerActive || isTransferActive || currentTitle.isNotEmpty()) PILL_LARGE
+            else if (isTimerActive || isNavigationActive || isTransferActive || isMediaActive) PILL_LARGE
             else PILL_SMALL
         )
+    }
+
+    private fun getCurrentRotation(): Int {
+        return try {
+            val wm = getSystemService(WINDOW_SERVICE) as WindowManager
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+                wm.defaultDisplay.rotation
+            } else {
+                @Suppress("DEPRECATION")
+                wm.defaultDisplay.rotation
+            }
+        } catch (_: Exception) {
+            Surface.ROTATION_0
+        }
+    }
+    private fun applyPillGravityForRotation(params: WindowManager.LayoutParams, rotation: Int) {
+        when (rotation) {
+            Surface.ROTATION_90 -> {
+                // Cogu cihazda 90 derecede kamera sol kenara gelir.
+                params.gravity = Gravity.START or Gravity.CENTER_VERTICAL
+                params.x = 20
+                params.y = 0
+            }
+            Surface.ROTATION_270 -> {
+                // Ters yatayda kamera sag kenara kayar.
+                params.gravity = Gravity.END or Gravity.CENTER_VERTICAL
+                params.x = 20
+                params.y = 0
+            }
+            else -> {
+                params.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                params.x = 0
+                params.y = 20
+            }
+        }
+    }
+
+    private fun updatePillPositionForRotation(force: Boolean = false) {
+        if (!::pillView.isInitialized || !isOverlayAttached) return
+        val params = pillView.layoutParams as? WindowManager.LayoutParams ?: return
+        val rotation = getCurrentRotation()
+        if (!force && rotation == lastRotation) return
+        lastRotation = rotation
+        applyPillGravityForRotation(params, rotation)
+        runCatching { windowManager.updateViewLayout(pillView, params) }
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        updatePillPositionForRotation(force = true)
     }
 
     private fun createNotification(): Notification {
@@ -699,13 +1168,20 @@ class OverlayService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        isRunning = false
         stopVisibilityMonitor()
+        visibilityHandler.removeCallbacks(pulseResetRunnable)
         widthAnimator?.cancel()
         stopTimerIconAnimation()
-        stopBarsAnimation()
-        unregisterReceiver(mediaReceiver)
-        if (::pillView.isInitialized) {
-            windowManager.removeView(pillView)
+        stopNavigationIconAnimation()
+        stopMediaVisualizerAnimation()
+        if (isReceiverRegistered) {
+            runCatching { unregisterReceiver(mediaReceiver) }
+            isReceiverRegistered = false
+        }
+        if (::pillView.isInitialized && isOverlayAttached) {
+            runCatching { windowManager.removeView(pillView) }
+            isOverlayAttached = false
         }
     }
 
@@ -715,9 +1191,15 @@ class OverlayService : Service() {
 class ScreenReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context?, intent: Intent?) {
         if (intent?.action == Intent.ACTION_SCREEN_ON) {
-            context?.startForegroundService(
-                Intent(context, OverlayService::class.java)
-            )
+            val safeContext = context ?: return
+            if (!Settings.canDrawOverlays(safeContext)) return
+            runCatching {
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                    safeContext.startForegroundService(Intent(safeContext, OverlayService::class.java))
+                } else {
+                    safeContext.startService(Intent(safeContext, OverlayService::class.java))
+                }
+            }
         }
     }
 }

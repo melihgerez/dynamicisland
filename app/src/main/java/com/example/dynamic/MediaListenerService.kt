@@ -5,9 +5,12 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.Canvas
 import android.graphics.Bitmap
 import android.app.Notification
 import android.app.PendingIntent
+import android.graphics.drawable.BitmapDrawable
+import android.graphics.drawable.Drawable
 import android.media.MediaMetadata
 import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
@@ -22,9 +25,9 @@ class MediaListenerService : NotificationListenerService() {
     private val mediaPackages = setOf(
         "com.spotify.music",
         "com.google.android.youtube",
-        "com.google.android.apps.youtube.music",
-        "com.google.android.apps.maps"
+        "com.google.android.apps.youtube.music"
     )
+    private val navigationPackages = setOf("com.google.android.apps.maps")
     private val transferPackages = setOf(
         "com.instagram.android",
         "com.whatsapp",
@@ -37,6 +40,7 @@ class MediaListenerService : NotificationListenerService() {
         "com.whatsapp"
     )
     private val activeTransferNotifications = mutableSetOf<String>()
+    private val activeNavigationNotifications = mutableSetOf<String>()
     private val callActionMap = mutableMapOf<String, CallActions>()
     private var latestCallKey: String? = null
 
@@ -47,10 +51,12 @@ class MediaListenerService : NotificationListenerService() {
 
     private val commandReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            val command = intent?.getStringExtra("command") ?: return
+            val action = intent?.action ?: return
+            val command = intent.getStringExtra("command")
             try {
-                when (intent.action) {
+                when (action) {
                     "MEDIA_COMMAND" -> {
+                        if (command.isNullOrBlank()) return
                         val sessionManager = getSystemService(MEDIA_SESSION_SERVICE) as MediaSessionManager
                         val controllers = sessionManager.getActiveSessions(
                             ComponentName(this@MediaListenerService, MediaListenerService::class.java)
@@ -69,11 +75,27 @@ class MediaListenerService : NotificationListenerService() {
                         }
                     }
                     "CALL_COMMAND" -> {
+                        if (command.isNullOrBlank()) return
                         val key = intent.getStringExtra("callKey") ?: latestCallKey ?: return
                         val actions = callActionMap[key] ?: return
                         when (command) {
                             "ANSWER" -> actions.answer?.send()
                             "REJECT" -> actions.reject?.send()
+                        }
+                    }
+                    "PROCESS_COMMAND" -> {
+                        when (intent.getStringExtra("mode")) {
+                            "MEDIA" -> toggleActiveMediaPlayback()
+                            "CALL" -> {
+                                val key = intent.getStringExtra("callKey") ?: latestCallKey
+                                if (key != null) {
+                                    callActionMap[key]?.reject?.send()
+                                }
+                            }
+                            else -> {
+                                val sourcePackage = intent.getStringExtra("sourcePackage")
+                                openApp(sourcePackage)
+                            }
                         }
                     }
                 }
@@ -88,6 +110,7 @@ class MediaListenerService : NotificationListenerService() {
         val filter = IntentFilter().apply {
             addAction("MEDIA_COMMAND")
             addAction("CALL_COMMAND")
+            addAction("PROCESS_COMMAND")
         }
         ContextCompat.registerReceiver(this, commandReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
     }
@@ -103,11 +126,25 @@ class MediaListenerService : NotificationListenerService() {
         val packageName = sbn?.packageName ?: return
         if (isCallNotification(sbn)) {
             handleCallNotification(sbn)
+            return
         }
         if (transferPackages.contains(packageName)) {
             handleTransferNotification(sbn)
+            return
         }
-        if (!mediaPackages.contains(packageName)) return
+        if (navigationPackages.contains(packageName)) {
+            handleNavigationNotification(sbn)
+            return
+        }
+        if (mediaPackages.contains(packageName)) {
+            handleMediaNotification(packageName)
+            return
+        }
+
+        sendPulseNotification(sbn)
+    }
+
+    private fun handleMediaNotification(packageName: String) {
 
         try {
             val sessionManager = getSystemService(MEDIA_SESSION_SERVICE) as MediaSessionManager
@@ -123,8 +160,11 @@ class MediaListenerService : NotificationListenerService() {
                 val metadata = controller.metadata ?: continue
                 val title = metadata.getString(MediaMetadata.METADATA_KEY_TITLE) ?: continue
                 val artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: ""
-                val art: Bitmap? = metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
+                val artRaw: Bitmap? = metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
                     ?: metadata.getBitmap(MediaMetadata.METADATA_KEY_ART)
+                val art: Bitmap? = artRaw?.let {
+                    Bitmap.createScaledBitmap(it, 96, 96, true)
+                }
                 val playbackState = controller.playbackState?.state
 
                 Log.d("DynamicIsland", "Müzik: $title - $artist")
@@ -160,6 +200,9 @@ class MediaListenerService : NotificationListenerService() {
         }
         if (sbn?.key != null && activeTransferNotifications.remove(sbn.key) && activeTransferNotifications.isEmpty()) {
             sendBroadcast(Intent("TRANSFER_STOPPED"))
+        }
+        if (sbn?.key != null && activeNavigationNotifications.remove(sbn.key) && activeNavigationNotifications.isEmpty()) {
+            sendBroadcast(Intent("NAVIGATION_STOPPED"))
         }
     }
 
@@ -242,5 +285,78 @@ class MediaListenerService : NotificationListenerService() {
             putExtra("transferType", transferType)
             putExtra("text", message)
         })
+    }
+
+    private fun handleNavigationNotification(sbn: StatusBarNotification) {
+        val notification = sbn.notification ?: return
+        val extras = notification.extras ?: return
+        val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
+        val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString().orEmpty()
+        val lower = "$title $text".lowercase(Locale.ROOT)
+
+        val looksLikeNavigation = notification.category == Notification.CATEGORY_NAVIGATION ||
+                lower.contains("rota") || lower.contains("yol") || lower.contains("turn") ||
+                lower.contains("exit") || lower.contains("arrive") || lower.contains("km") || lower.contains("dk")
+
+        if (!looksLikeNavigation) {
+            if (activeNavigationNotifications.remove(sbn.key) && activeNavigationNotifications.isEmpty()) {
+                sendBroadcast(Intent("NAVIGATION_STOPPED"))
+            }
+            return
+        }
+
+        activeNavigationNotifications.add(sbn.key)
+        val message = (text.ifBlank { title }).ifBlank { "Yol tarifi aktif" }
+        sendBroadcast(Intent("NAVIGATION_UPDATE").apply {
+            putExtra("sourcePackage", sbn.packageName)
+            putExtra("text", message)
+        })
+    }
+
+    private fun sendPulseNotification(sbn: StatusBarNotification) {
+        val notification = sbn.notification ?: return
+        if ((notification.flags and Notification.FLAG_ONGOING_EVENT) != 0) return
+        if (notification.category == Notification.CATEGORY_CALL || notification.category == Notification.CATEGORY_NAVIGATION) return
+
+        val iconBitmap = runCatching {
+            val drawable = packageManager.getApplicationIcon(sbn.packageName)
+            drawableToBitmap(drawable)
+        }.getOrNull()
+
+        sendBroadcast(Intent("PULSE_UPDATE").apply {
+            putExtra("sourcePackage", sbn.packageName)
+            putExtra("appIcon", iconBitmap)
+        })
+    }
+
+    private fun drawableToBitmap(drawable: Drawable): Bitmap {
+        if (drawable is BitmapDrawable && drawable.bitmap != null) return drawable.bitmap
+        val width = drawable.intrinsicWidth.coerceAtLeast(1)
+        val height = drawable.intrinsicHeight.coerceAtLeast(1)
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        drawable.setBounds(0, 0, canvas.width, canvas.height)
+        drawable.draw(canvas)
+        return bitmap
+    }
+
+    private fun toggleActiveMediaPlayback() {
+        val sessionManager = getSystemService(MEDIA_SESSION_SERVICE) as MediaSessionManager
+        val controllers = sessionManager.getActiveSessions(
+            ComponentName(this@MediaListenerService, MediaListenerService::class.java)
+        )
+        val controller = controllers.firstOrNull() ?: return
+        if (controller.playbackState?.state == PlaybackState.STATE_PLAYING) {
+            controller.transportControls.pause()
+        } else {
+            controller.transportControls.play()
+        }
+    }
+
+    private fun openApp(packageName: String?) {
+        if (packageName.isNullOrBlank()) return
+        val launchIntent = packageManager.getLaunchIntentForPackage(packageName) ?: return
+        launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        runCatching { startActivity(launchIntent) }
     }
 }
