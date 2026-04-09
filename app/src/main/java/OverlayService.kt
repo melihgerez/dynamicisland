@@ -9,10 +9,12 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.content.res.Configuration
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.drawable.BitmapDrawable
+import android.graphics.drawable.Drawable
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -21,7 +23,6 @@ import android.os.Vibrator
 import android.os.VibratorManager
 import android.provider.Settings
 import android.view.Gravity
-import android.view.Surface
 import android.view.View
 import android.view.WindowManager
 import android.widget.ImageView
@@ -56,7 +57,10 @@ class OverlayService : Service() {
     private val PILL_CALL = 400
     private val PILL_EXPANDED = 500
     private val PILL_HEIGHT = 82
-    private val PULSE_TIMEOUT_MS = 900L
+    private val PULSE_TIMEOUT_MS = 4000L
+    private val PULSE_IN_DURATION_MS = 170L
+    private val PULSE_OUT_DURATION_MS = 220L
+    private val DEFAULT_ICON_BG_COLOR = Color.parseColor("#202124")
     private val SPOTIFY_PACKAGE = "com.spotify.music"
     private val MEDIA_TARGET_PACKAGES = listOf(
         SPOTIFY_PACKAGE,
@@ -72,6 +76,9 @@ class OverlayService : Service() {
     private var widthAnimator: ValueAnimator? = null
     private var timerIconAnimator: ValueAnimator? = null
     private var navigationIconAnimator: ValueAnimator? = null
+    private var pulseInAnimator: ValueAnimator? = null
+    private var pulseOutAnimator: ValueAnimator? = null
+    private var pulseAnimationGeneration: Int = 0
     private var isPillHiddenForForegroundApp = false
     private var isTimerActive = false
     private var isNavigationActive = false
@@ -82,7 +89,6 @@ class OverlayService : Service() {
     private var isPulseActive = false
     private var isReceiverRegistered = false
     private var isOverlayAttached = false
-    private var lastRotation = Surface.ROTATION_0
     private var activeMediaSourcePackage: String? = null
     private var activeTimerSourcePackage: String? = null
     private var activeNavigationSourcePackage: String? = null
@@ -96,12 +102,15 @@ class OverlayService : Service() {
     private var visualizerMode = "BAR"
     private val pulseResetRunnable = Runnable {
         if (!isPulseActive) return@Runnable
-        clearPulseState()
-        renderStateAfterTransient()
+        val generation = pulseAnimationGeneration
+        playPulseOutAnimation(generation) {
+            if (!isPulseActive || generation != pulseAnimationGeneration) return@playPulseOutAnimation
+            clearPulseState()
+            renderStateAfterTransient()
+        }
     }
     private val visibilityCheckRunnable = object : Runnable {
         override fun run() {
-            updatePillPositionForRotation()
             updatePillVisibilityForForegroundApp()
             visibilityHandler.postDelayed(this, 700)
         }
@@ -121,10 +130,21 @@ class OverlayService : Service() {
                         @Suppress("DEPRECATION")
                         intent.getParcelableExtra("albumArt")
                     }
-                    if (art != null) {
-                        albumArt.setImageBitmap(art)
+                    val appIcon = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableExtra("appIcon", Bitmap::class.java)
                     } else {
+                        @Suppress("DEPRECATION")
+                        intent.getParcelableExtra("appIcon")
+                    }
+                    if (art != null) {
+                        setAlbumArtBitmapWithAdaptiveBackground(art)
+                    } else if (appIcon != null) {
+                        setAlbumArtBitmapWithAdaptiveBackground(appIcon)
+                    } else if (!setAlbumArtFromPackage(activeMediaSourcePackage)) {
                         albumArt.setImageResource(R.drawable.ic_dynamic_media)
+                        setAlbumArtBackground(DEFAULT_ICON_BG_COLOR)
+                    } else {
+                        Unit
                     }
                     if (!isTimerActive && !isNavigationActive && !isTransferActive && !isCallActive && !isPulseActive) {
                         showMediaVisualizer()
@@ -282,21 +302,16 @@ class OverlayService : Service() {
                     val sourcePackage = intent.getStringExtra("sourcePackage")
                     activePulseSourcePackage = sourcePackage
                     isPulseActive = true
+                    pulseAnimationGeneration += 1
+                    val generation = pulseAnimationGeneration
 
-                    val isWhatsAppMessage = sourcePackage == "com.whatsapp"
-                    if (isWhatsAppMessage) {
-                        val waIcon = runCatching { packageManager.getApplicationIcon("com.whatsapp") }.getOrNull()
-                        if (waIcon != null) {
-                            albumArt.setImageDrawable(waIcon)
-                        } else if (iconBitmap != null) {
-                            albumArt.setImageBitmap(iconBitmap)
-                        } else {
-                            albumArt.setImageResource(R.drawable.ic_dynamic_media)
-                        }
-                    } else if (iconBitmap != null) {
-                        albumArt.setImageBitmap(iconBitmap)
-                    } else {
+                    if (iconBitmap != null) {
+                        setAlbumArtBitmapWithAdaptiveBackground(iconBitmap)
+                    } else if (!setAlbumArtFromPackage(sourcePackage)) {
                         albumArt.setImageResource(R.drawable.ic_dynamic_media)
+                        setAlbumArtBackground(DEFAULT_ICON_BG_COLOR)
+                    } else {
+                        Unit
                     }
                     albumArt.visibility = View.VISIBLE
                     barsContainer.visibility = View.GONE
@@ -305,6 +320,7 @@ class OverlayService : Service() {
                     timerText.visibility = View.GONE
                     setupCompactContent()
                     animateWidth(PILL_LARGE)
+                    playPulseInAnimation(generation)
                     performTickVibration(18L)
                     visibilityHandler.removeCallbacks(pulseResetRunnable)
                     visibilityHandler.postDelayed(pulseResetRunnable, PULSE_TIMEOUT_MS)
@@ -313,8 +329,8 @@ class OverlayService : Service() {
                     isCallActive = true
                     activeCallSourcePackage = intent.getStringExtra("sourcePackage")
                     activeCallKey = intent.getStringExtra("callKey")
-                    // Cagri durumunda her zaman telefon ikonu gosterilir.
                     albumArt.setImageResource(R.drawable.ic_dynamic_call)
+                    setAlbumArtBackground(Color.parseColor("#D93025"))
                     albumArt.visibility = View.VISIBLE
                     barsContainer.visibility = View.GONE
                     waveContainer.visibility = View.GONE
@@ -410,15 +426,11 @@ class OverlayService : Service() {
             isReceiverRegistered = true
         }
         startVisibilityMonitor()
-        updatePillPositionForRotation(force = true)
         return START_STICKY
     }
 
     private fun showOverlay() {
-        if (isOverlayAttached && ::pillView.isInitialized) {
-            updatePillPositionForRotation(force = true)
-            return
-        }
+        if (isOverlayAttached && ::pillView.isInitialized) return
 
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
 
@@ -438,8 +450,9 @@ class OverlayService : Service() {
                 marginEnd = 12
             }
             scaleType = ImageView.ScaleType.CENTER_CROP
+            clipToOutline = true
             background = android.graphics.drawable.GradientDrawable().apply {
-                setColor(Color.parseColor("#1DB954"))
+                setColor(DEFAULT_ICON_BG_COLOR)
                 cornerRadius = 8f
             }
             visibility = View.GONE
@@ -596,11 +609,10 @@ class OverlayService : Service() {
                     WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         ).apply {
-            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            y = 20
+                            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                            x = 0
+                            y = 20
         }
-
-        applyPillGravityForRotation(params, getCurrentRotation())
 
         windowManager.addView(pillView, params)
         isOverlayAttached = true
@@ -621,17 +633,14 @@ class OverlayService : Service() {
             pillView.addView(albumArt)
             pillView.addView(centerSpacer)
         } else if (isCallActive) {
-            // Cagri ekraninda da sadece ikon gorunur; yanitla/reddet butonlari gizlidir.
             pillView.addView(albumArt)
             pillView.addView(centerSpacer)
         } else if (isTimerActive || isNavigationActive || isTransferActive) {
-            // Timer/transfer modunda solda ikon, sagda bilgi metni gorunur.
             timerText.layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
             pillView.addView(timerIcon)
             pillView.addView(centerSpacer)
             pillView.addView(timerText)
         } else {
-            // Compact halde kapağı sola, barları sağa sabitliyoruz.
             pillView.addView(albumArt)
             pillView.addView(centerSpacer)
             pillView.addView(if (visualizerMode == "WAVE") waveContainer else barsContainer)
@@ -734,7 +743,6 @@ class OverlayService : Service() {
 
     private fun startTimerIconAnimation() {
         if (timerIconAnimator?.isRunning == true) return
-
         timerIconAnimator?.cancel()
         timerIconAnimator = ValueAnimator.ofFloat(0f, 360f).apply {
             duration = 1200
@@ -749,7 +757,6 @@ class OverlayService : Service() {
 
     private fun startNavigationIconAnimation() {
         if (navigationIconAnimator?.isRunning == true) return
-
         navigationIconAnimator?.cancel()
         navigationIconAnimator = ValueAnimator.ofFloat(0.88f, 1.08f).apply {
             duration = 900
@@ -875,8 +882,70 @@ class OverlayService : Service() {
 
     private fun clearPulseState() {
         visibilityHandler.removeCallbacks(pulseResetRunnable)
+        pulseInAnimator?.cancel()
+        pulseOutAnimator?.cancel()
+        resetPulseAnimationState()
         isPulseActive = false
         activePulseSourcePackage = null
+    }
+
+    private fun playPulseInAnimation(generation: Int) {
+        if (!::pillView.isInitialized) return
+        pulseOutAnimator?.cancel()
+        pulseInAnimator?.cancel()
+        pillView.alpha = 0.72f
+        pillView.scaleX = 0.93f
+        pillView.scaleY = 0.93f
+        pulseInAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = PULSE_IN_DURATION_MS
+            interpolator = android.view.animation.DecelerateInterpolator()
+            addUpdateListener {
+                if (generation != pulseAnimationGeneration || !isPulseActive) return@addUpdateListener
+                val t = it.animatedValue as Float
+                pillView.alpha = 0.72f + (0.28f * t)
+                pillView.scaleX = 0.93f + (0.07f * t)
+                pillView.scaleY = 0.93f + (0.07f * t)
+            }
+        }
+        pulseInAnimator?.start()
+    }
+
+    private fun playPulseOutAnimation(generation: Int, onEnd: () -> Unit) {
+        if (!::pillView.isInitialized) {
+            onEnd()
+            return
+        }
+        pulseInAnimator?.cancel()
+        pulseOutAnimator?.cancel()
+        pulseOutAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = PULSE_OUT_DURATION_MS
+            interpolator = android.view.animation.AccelerateDecelerateInterpolator()
+            addUpdateListener {
+                if (generation != pulseAnimationGeneration || !isPulseActive) return@addUpdateListener
+                val t = it.animatedValue as Float
+                pillView.alpha = 1f - (0.28f * t)
+                pillView.scaleX = 1f - (0.07f * t)
+                pillView.scaleY = 1f - (0.07f * t)
+            }
+            addListener(object : android.animation.Animator.AnimatorListener {
+                override fun onAnimationStart(animation: android.animation.Animator) = Unit
+                override fun onAnimationCancel(animation: android.animation.Animator) = Unit
+                override fun onAnimationRepeat(animation: android.animation.Animator) = Unit
+                override fun onAnimationEnd(animation: android.animation.Animator) {
+                    if (generation != pulseAnimationGeneration) return
+                    resetPulseAnimationState()
+                    onEnd()
+                }
+            })
+        }
+        pulseOutAnimator?.start()
+    }
+
+    private fun resetPulseAnimationState() {
+        if (!::pillView.isInitialized) return
+        pillView.alpha = 1f
+        pillView.scaleX = 1f
+        pillView.scaleY = 1f
     }
 
     private fun formatTimerText(intent: Intent, isCountdown: Boolean): String {
@@ -964,9 +1033,7 @@ class OverlayService : Service() {
     }
 
     private fun shouldHideForForegroundApp(): Boolean {
-        if (isPulseActive) {
-            return false
-        }
+        if (isPulseActive) return false
 
         if (isCallActive) {
             val callPackages = buildList {
@@ -1002,7 +1069,6 @@ class OverlayService : Service() {
             return transferPackages.any { isPackageForeground(it) }
         }
 
-        // Spotify icinde local player UI varken pill gizli, uygulamadan cikinca tekrar gorunur.
         if (isMediaActive && (activeMediaSourcePackage == SPOTIFY_PACKAGE || isPackageForeground(SPOTIFY_PACKAGE))) {
             return isPackageForeground(SPOTIFY_PACKAGE)
         }
@@ -1035,6 +1101,67 @@ class OverlayService : Service() {
         } catch (_: Exception) {
             false
         }
+    }
+
+    private fun setAlbumArtFromPackage(packageName: String?): Boolean {
+        if (packageName.isNullOrBlank()) return false
+        return runCatching {
+            val drawable = packageManager.getApplicationIcon(packageName)
+            val bitmap = drawableToBitmap(drawable)
+            setAlbumArtBitmapWithAdaptiveBackground(bitmap)
+            true
+        }.getOrDefault(false)
+    }
+
+    private fun setAlbumArtBitmapWithAdaptiveBackground(bitmap: Bitmap) {
+        albumArt.setImageBitmap(bitmap)
+        setAlbumArtBackground(pickAdaptiveBackgroundColor(bitmap))
+    }
+
+    private fun setAlbumArtBackground(color: Int) {
+        (albumArt.background as? android.graphics.drawable.GradientDrawable)?.setColor(color)
+    }
+
+    private fun pickAdaptiveBackgroundColor(bitmap: Bitmap): Int {
+        val sample = Bitmap.createScaledBitmap(bitmap, 18, 18, true)
+        var r = 0L
+        var g = 0L
+        var b = 0L
+        var count = 0L
+        for (x in 0 until sample.width) {
+            for (y in 0 until sample.height) {
+                val c = sample.getPixel(x, y)
+                val alpha = Color.alpha(c)
+                if (alpha < 24) continue
+                r += Color.red(c)
+                g += Color.green(c)
+                b += Color.blue(c)
+                count++
+            }
+        }
+        if (count == 0L) return DEFAULT_ICON_BG_COLOR
+
+        val avgR = (r / count).toInt()
+        val avgG = (g / count).toInt()
+        val avgB = (b / count).toInt()
+
+        // Make it more vivid while keeping a dark AMOLED-friendly tone.
+        val hsv = FloatArray(3)
+        Color.RGBToHSV(avgR, avgG, avgB, hsv)
+        hsv[1] = (hsv[1] * 1.35f + 0.10f).coerceIn(0.38f, 0.92f)
+        hsv[2] = (hsv[2] * 0.58f + 0.06f).coerceIn(0.20f, 0.44f)
+        return Color.HSVToColor(hsv)
+    }
+
+    private fun drawableToBitmap(drawable: Drawable): Bitmap {
+        if (drawable is BitmapDrawable && drawable.bitmap != null) return drawable.bitmap
+        val width = drawable.intrinsicWidth.coerceAtLeast(1)
+        val height = drawable.intrinsicHeight.coerceAtLeast(1)
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        drawable.setBounds(0, 0, canvas.width, canvas.height)
+        drawable.draw(canvas)
+        return bitmap
     }
 
     private fun expandControls() {
@@ -1093,62 +1220,11 @@ class OverlayService : Service() {
     private fun collapseControls() {
         isExpanded = false
         setupCompactContent()
-
         animateWidth(
             if (isCallActive) PILL_CALL
             else if (isTimerActive || isNavigationActive || isTransferActive || isMediaActive) PILL_LARGE
             else PILL_SMALL
         )
-    }
-
-    private fun getCurrentRotation(): Int {
-        return try {
-            val wm = getSystemService(WINDOW_SERVICE) as WindowManager
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
-                wm.defaultDisplay.rotation
-            } else {
-                @Suppress("DEPRECATION")
-                wm.defaultDisplay.rotation
-            }
-        } catch (_: Exception) {
-            Surface.ROTATION_0
-        }
-    }
-    private fun applyPillGravityForRotation(params: WindowManager.LayoutParams, rotation: Int) {
-        when (rotation) {
-            Surface.ROTATION_90 -> {
-                // Cogu cihazda 90 derecede kamera sol kenara gelir.
-                params.gravity = Gravity.START or Gravity.CENTER_VERTICAL
-                params.x = 20
-                params.y = 0
-            }
-            Surface.ROTATION_270 -> {
-                // Ters yatayda kamera sag kenara kayar.
-                params.gravity = Gravity.END or Gravity.CENTER_VERTICAL
-                params.x = 20
-                params.y = 0
-            }
-            else -> {
-                params.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-                params.x = 0
-                params.y = 20
-            }
-        }
-    }
-
-    private fun updatePillPositionForRotation(force: Boolean = false) {
-        if (!::pillView.isInitialized || !isOverlayAttached) return
-        val params = pillView.layoutParams as? WindowManager.LayoutParams ?: return
-        val rotation = getCurrentRotation()
-        if (!force && rotation == lastRotation) return
-        lastRotation = rotation
-        applyPillGravityForRotation(params, rotation)
-        runCatching { windowManager.updateViewLayout(pillView, params) }
-    }
-
-    override fun onConfigurationChanged(newConfig: Configuration) {
-        super.onConfigurationChanged(newConfig)
-        updatePillPositionForRotation(force = true)
     }
 
     private fun createNotification(): Notification {
@@ -1171,6 +1247,9 @@ class OverlayService : Service() {
         isRunning = false
         stopVisibilityMonitor()
         visibilityHandler.removeCallbacks(pulseResetRunnable)
+        pulseInAnimator?.cancel()
+        pulseOutAnimator?.cancel()
+        resetPulseAnimationState()
         widthAnimator?.cancel()
         stopTimerIconAnimation()
         stopNavigationIconAnimation()
@@ -1184,6 +1263,7 @@ class OverlayService : Service() {
             isOverlayAttached = false
         }
     }
+
 
     override fun onBind(intent: Intent?): IBinder? = null
 }

@@ -43,6 +43,7 @@ class MediaListenerService : NotificationListenerService() {
     private val activeNavigationNotifications = mutableSetOf<String>()
     private val callActionMap = mutableMapOf<String, CallActions>()
     private var latestCallKey: String? = null
+    private var isCommandReceiverRegistered = false
 
     private data class CallActions(
         val answer: PendingIntent?,
@@ -107,17 +108,21 @@ class MediaListenerService : NotificationListenerService() {
 
     override fun onListenerConnected() {
         super.onListenerConnected()
+        if (isCommandReceiverRegistered) return
         val filter = IntentFilter().apply {
             addAction("MEDIA_COMMAND")
             addAction("CALL_COMMAND")
             addAction("PROCESS_COMMAND")
         }
         ContextCompat.registerReceiver(this, commandReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+        isCommandReceiverRegistered = true
     }
 
     override fun onListenerDisconnected() {
         super.onListenerDisconnected()
-        unregisterReceiver(commandReceiver)
+        if (!isCommandReceiverRegistered) return
+        runCatching { unregisterReceiver(commandReceiver) }
+        isCommandReceiverRegistered = false
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
@@ -129,8 +134,7 @@ class MediaListenerService : NotificationListenerService() {
             return
         }
         if (transferPackages.contains(packageName)) {
-            handleTransferNotification(sbn)
-            return
+            if (handleTransferNotification(sbn)) return
         }
         if (navigationPackages.contains(packageName)) {
             handleNavigationNotification(sbn)
@@ -158,13 +162,18 @@ class MediaListenerService : NotificationListenerService() {
 
             for (controller in prioritizedControllers) {
                 val metadata = controller.metadata ?: continue
-                val title = metadata.getString(MediaMetadata.METADATA_KEY_TITLE) ?: continue
+                val title = metadata.getString(MediaMetadata.METADATA_KEY_TITLE)
+                    ?.takeIf { it.isNotBlank() }
+                    ?: "Caliyor"
                 val artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: ""
                 val artRaw: Bitmap? = metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
                     ?: metadata.getBitmap(MediaMetadata.METADATA_KEY_ART)
                 val art: Bitmap? = artRaw?.let {
                     Bitmap.createScaledBitmap(it, 96, 96, true)
                 }
+                val appIcon: Bitmap? = runCatching {
+                    drawableToBitmap(packageManager.getApplicationIcon(controller.packageName))
+                }.getOrNull()
                 val playbackState = controller.playbackState?.state
 
                 Log.d("DynamicIsland", "Müzik: $title - $artist")
@@ -174,6 +183,7 @@ class MediaListenerService : NotificationListenerService() {
                         putExtra("title", title)
                         putExtra("artist", artist)
                         putExtra("albumArt", art)
+                        putExtra("appIcon", appIcon)
                         putExtra("sourcePackage", controller.packageName)
                     }
                     sendBroadcast(intent)
@@ -207,8 +217,24 @@ class MediaListenerService : NotificationListenerService() {
     }
 
     private fun isCallNotification(sbn: StatusBarNotification): Boolean {
-        val category = sbn.notification?.category
-        return category == Notification.CATEGORY_CALL || callPackages.contains(sbn.packageName)
+        val notification = sbn.notification ?: return false
+        val category = notification.category
+        if (category == Notification.CATEGORY_CALL) return true
+        if (!callPackages.contains(sbn.packageName)) return false
+        return hasCallActions(notification)
+    }
+
+    private fun hasCallActions(notification: Notification): Boolean {
+        val actions = notification.actions ?: return false
+        return actions.any { action ->
+            val label = action.title?.toString()?.lowercase(Locale.ROOT).orEmpty()
+            label.contains("answer") ||
+                    label.contains("yanitla") ||
+                    label.contains("accept") ||
+                    label.contains("decline") ||
+                    label.contains("reddet") ||
+                    label.contains("reject")
+        }
     }
 
     private fun handleCallNotification(sbn: StatusBarNotification) {
@@ -240,9 +266,9 @@ class MediaListenerService : NotificationListenerService() {
         })
     }
 
-    private fun handleTransferNotification(sbn: StatusBarNotification) {
-        val notification = sbn.notification ?: return
-        val extras = notification.extras ?: return
+    private fun handleTransferNotification(sbn: StatusBarNotification): Boolean {
+        val notification = sbn.notification ?: return false
+        val extras = notification.extras ?: return false
         val progress = extras.getInt(Notification.EXTRA_PROGRESS, -1)
         val max = extras.getInt(Notification.EXTRA_PROGRESS_MAX, -1)
         val isIndeterminate = extras.getBoolean(Notification.EXTRA_PROGRESS_INDETERMINATE, false)
@@ -259,7 +285,7 @@ class MediaListenerService : NotificationListenerService() {
             if (activeTransferNotifications.remove(sbn.key) && activeTransferNotifications.isEmpty()) {
                 sendBroadcast(Intent("TRANSFER_STOPPED"))
             }
-            return
+            return false
         }
 
         activeTransferNotifications.add(sbn.key)
@@ -285,6 +311,7 @@ class MediaListenerService : NotificationListenerService() {
             putExtra("transferType", transferType)
             putExtra("text", message)
         })
+        return true
     }
 
     private fun handleNavigationNotification(sbn: StatusBarNotification) {
@@ -318,10 +345,23 @@ class MediaListenerService : NotificationListenerService() {
         if ((notification.flags and Notification.FLAG_ONGOING_EVENT) != 0) return
         if (notification.category == Notification.CATEGORY_CALL || notification.category == Notification.CATEGORY_NAVIGATION) return
 
-        val iconBitmap = runCatching {
+        val largeIconBitmap = runCatching { notification.getLargeIcon()?.let { drawableToBitmap(it.loadDrawable(this) ?: return@let null) } }
+            .getOrNull()
+
+        val smallIconBitmap = runCatching {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+                notification.smallIcon?.loadDrawable(this)?.let { drawableToBitmap(it) }
+            } else {
+                null
+            }
+        }.getOrNull()
+
+        val appIconBitmap = runCatching {
             val drawable = packageManager.getApplicationIcon(sbn.packageName)
             drawableToBitmap(drawable)
         }.getOrNull()
+
+        val iconBitmap = largeIconBitmap ?: smallIconBitmap ?: appIconBitmap
 
         sendBroadcast(Intent("PULSE_UPDATE").apply {
             putExtra("sourcePackage", sbn.packageName)
